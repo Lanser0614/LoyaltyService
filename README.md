@@ -1816,7 +1816,208 @@ V2: persisted `customer_segments` + `customer_segment_memberships`.
 
 ---
 
-# 21. Финальная рекомендация
+# 21. Admin Panel — Filament
+
+Для админки используется Filament — Laravel-native решение, не требует отдельного фронтенда.
+Весь код остаётся в одном репозитории на PHP.
+
+```
+composer require filament/filament
+```
+
+---
+
+## 21.1 Структура
+
+```
+app/Filament/
+├── Resources/
+│   ├── CouponResource.php
+│   │   └── Pages/
+│   │       ├── ListCoupons.php
+│   │       ├── CreateCoupon.php
+│   │       └── EditCoupon.php
+│   ├── CustomerCouponResource.php
+│   ├── CouponUsageResource.php
+│   ├── OrderIncentiveApplicationResource.php
+│   ├── LoyaltyAccountResource.php
+│   └── CustomerStatsResource.php
+└── Pages/
+    └── CouponSimulationPage.php
+```
+
+---
+
+## 21.2 Что покрывает Filament из коробки
+
+### Управление купонами (CRUD)
+
+`CouponResource` — таблица с фильтрами по статусу, типу, дате + форма создания/редактирования.
+
+Форма разбита на tabs:
+
+```
+Tab 1 — Основная информация
+  code, name, coupon_kind, status, priority
+  starts_at, ends_at
+  usage_limit_total, usage_limit_per_customer
+  auto_apply, visible_to_customer, requires_code_input
+
+Tab 2 — Условия использования
+  Repeater: тип условия → динамические поля по типу
+  (cart.min_amount → input сумма)
+  (customer.segment → select сегмент)
+  (cart.has_combo → без доп. полей)
+
+Tab 3 — Условия выдачи
+  Repeater: аналогично условиям использования
+
+Tab 4 — Действие
+  Select: action_type
+  Динамические поля по типу:
+    percent → value, max_discount_amount
+    fixed → value
+    free_delivery → (нет полей)
+    free_product → searchable select по iiko_products + quantity
+    free_combo → searchable select по iiko_combos + quantity
+
+Tab 5 — Совместимость
+  Toggle: is_stackable_with_bellcoin
+  Toggle: is_stackable_with_other_coupons
+
+Tab 6 — Лимиты
+  issue_limit_total, issue_limit_per_customer
+```
+
+### Управление BellCoin / ledger
+
+`LoyaltyAccountResource` — read-only таблица с балансом клиентов.
+
+Каждая строка открывает RelationManager с ledger транзакциями:
+
+```
+loyalty_ledger_transactions
+  тип, сумма, balance_after, reason, order_id, created_at
+```
+
+Ручная корректировка баланса — отдельный Action с подтверждением:
+
+```
+AdjustBalanceAction → вводит сумму и причину → создаёт ledger transaction type=adjustment
+```
+
+### Логи применений
+
+`OrderIncentiveApplicationResource` — read-only таблица с фильтрами:
+
+```
+фильтры: customer_id, coupon_code, status, дата
+колонки: order_id, customer_id, coupon_code, discount_amount, status, applied_at
+раскрывается: incentives_snapshot json
+```
+
+### Управление customer_coupons
+
+`CustomerCouponResource` — таблица выданных купонов.
+
+Ручная выдача через Action:
+
+```
+IssueCustomerCouponAction
+  → выбрать клиента + купон + причину
+  → вызывает CustomerCouponIssueService
+```
+
+### Сегменты клиентов
+
+`CustomerStatsResource` — read-only таблица `customer_behavior_stats`.
+
+Computed columns для сегментов:
+
+```
+new_customer, loyal_customer, vip_customer, inactive_30_days — иконки в таблице
+```
+
+---
+
+## 21.3 Что требует кастомной реализации
+
+### UI Builder условий и actions
+
+Filament не имеет готового drag-and-drop rule builder.
+Для MVP используем **Filament Repeater** — функционально, быстро.
+
+```php
+Repeater::make('conditions')
+    ->schema([
+        Select::make('condition_type')
+            ->options(ConditionHandlerRegistry::getDefinitions())
+            ->reactive(),
+
+        TextInput::make('value')
+            ->visible(fn ($get) => in_array($get('condition_type'), ['cart.min_amount'])),
+
+        Select::make('segment_code')
+            ->options(CustomerSegment::pluck('name', 'code'))
+            ->visible(fn ($get) => $get('condition_type') === 'customer.segment'),
+    ])
+```
+
+Красивый drag-and-drop builder — Phase 8+, кастомный Filament Widget + Alpine.js.
+
+### Simulation
+
+Кастомная страница `CouponSimulationPage`:
+
+```
+Форма:
+  coupon_code или customer_coupon_id
+  order_total
+  items (repeater: iiko_product_id + quantity)
+  use_bellcoin + bellcoin_amount
+  customer_id
+
+Кнопка "Simulate"
+  → вызывает CouponSimulationService
+  → показывает результат в modal:
+    allowed / rejected
+    discount_amount
+    free_items
+    failure_reason если rejected
+    какие conditions прошли / не прошли
+```
+
+---
+
+## 21.4 Оценка времени на Filament
+
+| Раздел | Сложность | Время |
+| --- | --- | --- |
+| CouponResource CRUD + tabs | средняя | 2–3 дня |
+| Conditions/Actions Repeater builder | средняя | 2–3 дня |
+| LoyaltyAccountResource + ledger | низкая | 1 день |
+| OrderIncentiveApplicationResource | низкая | 1 день |
+| CustomerCouponResource + issue action | низкая | 1 день |
+| CustomerStatsResource + segments | низкая | 1 день |
+| Simulation page | средняя | 1–2 дня |
+| **Итого** | | **9–12 дней** |
+
+---
+
+## 21.5 Правила для Filament
+
+```
+1. Все write операции через Application Services — не напрямую через Eloquent в Resource.
+2. LoyaltyAccountResource — только read. Изменения баланса только через AdjustBalanceAction.
+3. OrderIncentiveApplicationResource — только read. Никаких ручных изменений статусов.
+4. Simulation не резервирует ничего — только вызывает preview логику.
+5. Доступ через Filament Shield (role-based): маркетинг видит купоны, финансы видят ledger.
+```
+
+---
+
+
+# 22. Финальная рекомендация
 
 ```
 1.  Называть систему Loyalty & Promotion Service, а не Coupon Service.
@@ -1833,11 +2034,16 @@ V2: persisted `customer_segments` + `customer_segment_memberships`.
 12. Проверять StackingRules до reserve BellCoin и до create coupon_usage.
 13. BellCoin concurrency решается через lockForUpdate() + DB::transaction().
 14. Kafka idempotency через event_inbox с unique(event_id).
+15. Delivery IO ничего не знает о скидках — получает уже финальный request от Mobile App.
+16. Mobile App вызывает preview → apply → Delivery IO. Commit через Kafka WaitCooking.
+17. TTL job: reserved applications старше 5 минут → автоматический release.
+18. incentive_application_id передаётся в Delivery IO как reference для аудита.
+19. Админка на Filament — все write операции через Application Services, не напрямую.
 ```
 
 ---
 
-# 22. iiko API Integration
+# 23. iiko API Integration
 
 Loyalty & Promotion Service использует iiko Cloud API как единственный источник
 для синхронизации Catalog данных.
