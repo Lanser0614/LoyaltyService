@@ -10,6 +10,24 @@ Loyalty & Promotion Service — это модульный монолит для 
 
 Ключевая идея: **IIKO и Delivery IO остаются source of truth**, но Loyalty & Promotion Service хранит локальные projections, чтобы быстро и безопасно валидировать rewards без runtime-зависимости от внешних сервисов.
 
+## Текущее состояние реализации
+
+В текущем Laravel 10 проекте реализовано:
+
+- модульная структура в `modules/` с PSR-4 namespace `Modules\\`;
+- Filament admin panel: `/admin`;
+- Docker local development: приложение открывается на `http://127.0.0.1:8080`;
+- локальный PostgreSQL, Redis, Kafka, Kafka UI и Mailpit через `docker-compose.yml`;
+- IIKO sync commands для products, menus и combos;
+- checkout incentive API: `preview`, `apply`, `cancel`;
+- применение купона только по `coupon_code`;
+- автоматическая выдача guarantee coupon по Kafka event `Delivered`, если `delivered_at - cooking_start_at > 35 minutes`;
+- developer docs:
+  - `docs/create-coupon-ru.md`
+  - `docs/coupon-algorithm-ru.md`
+
+Важно: `customerCouponId` в checkout не используется. Любой выданный купон должен иметь уникальный `coupons.code`, который клиент передает как `coupon_code`.
+
 ## Что решаем
 
 - Единая логика скидок для mobile app, checkout, call center и marketing campaigns.
@@ -83,7 +101,7 @@ Mobile App
   ↓ POST /api/incentives/checkout/preview
     { customer_id, order_total, items, coupon_code, use_bellcoin, bellcoin_amount }
 Loyalty & Promotion Service
-  - валидирует coupon / customer_coupon
+  - валидирует coupon по coupon_code
   - проверяет BellCoin balance и redemption rules
   - проверяет StackingRules / IncentivePolicy
   - считает discount_amount, free_items, итоговую сумму
@@ -103,7 +121,6 @@ Loyalty & Promotion Service
   - повторяет все проверки (validate + stacking)
   - BEGIN TRANSACTION
       coupon_usage → reserved
-      customer_coupon → reserved
       BellCoin → reserved
       order_incentive_application → reserved
   - COMMIT
@@ -144,7 +161,6 @@ Loyalty Kafka consumer:
   - находит order_incentive_application по incentive_application_id
   - привязывает order_id
   - coupon_usage → applied
-  - customer_coupon → used
   - BellCoin reservation → committed
   - order_incentive_application → applied
 ```
@@ -155,7 +171,6 @@ Step 4b — Неуспех (TTL job)
 Если за 5 минут WaitCooking event не пришёл:
 Scheduled job каждую минуту находит reserved applications старше 5 минут:
   - coupon_usage → cancelled
-  - customer_coupon → available
   - BellCoin → released
   - order_incentive_application → cancelled
 ```
@@ -209,7 +224,7 @@ Testing: PHPUnit, RefreshDatabase, Testcontainers (опционально)
 ### Структура модулей (нативные namespaces)
 
 ```
-app/
+modules/
 ├── Promotion/
 │   ├── Models/
 │   ├── Services/
@@ -270,7 +285,8 @@ app/
 ```json
 "autoload": {
     "psr-4": {
-        "App\\": "app/"
+        "App\\": "app/",
+        "Modules\\": "modules/"
     }
 }
 ```
@@ -281,11 +297,11 @@ app/
 
 ```php
 // НЕПРАВИЛЬНО
-use App\Loyalty\Models\LoyaltyAccount;
+use Modules\Loyalty\Models\LoyaltyAccount;
 
 // ПРАВИЛЬНО
-use App\Loyalty\Services\BellCoinReserveService;
-use App\CustomerInsights\Contracts\CustomerSegmentProviderInterface;
+use Modules\Loyalty\Services\BellCoinReserveService;
+use Modules\CustomerInsights\Contracts\CustomerSegmentProviderInterface;
 ```
 
 Исключение — `Shared/`. Его могут импортировать все модули.
@@ -402,113 +418,57 @@ class LoyaltyPromotionServiceProvider extends ServiceProvider
 
 ## Development Environment: Docker & Docker Compose
 
-Docker Compose используется только для local development и integration testing.
+Docker Compose используется для local development и integration testing.
 Production deployment имеет отдельную инфраструктурную конфигурацию.
 
 ### Local development services
 
 ```
 postgres   - основная база данных сервиса
+app        - Laravel application container
+scheduler  - Laravel schedule:work
 kafka      - локальный Kafka broker
 kafka-ui   - web UI для просмотра topics/messages
 redis      - optional cache/rate limit, не для core balance
+mailpit    - локальный SMTP/webmail
 ```
 
 ### Recommended local ports
 
 ```
 Application API: 8080
+Filament Admin:   8080/admin
 PostgreSQL:      5432
 Kafka:           9092
 Kafka UI:        8085
 Redis:           6379
-```
-
-### docker-compose.yml
-
-```yaml
-version: "3.9"
-
-services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: loyalty-promotion-postgres
-    environment:
-      POSTGRES_DB: loyalty_promotion
-      POSTGRES_USER: loyalty_user
-      POSTGRES_PASSWORD: loyalty_password
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U loyalty_user -d loyalty_promotion"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
-  kafka:
-    image: bitnami/kafka:3.7
-    container_name: loyalty-promotion-kafka
-    ports:
-      - "9092:9092"
-    environment:
-      KAFKA_CFG_NODE_ID: 1
-      KAFKA_CFG_PROCESS_ROLES: broker,controller
-      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
-      ALLOW_PLAINTEXT_LISTENER: "yes"
-    volumes:
-      - kafka_data:/bitnami/kafka
-
-  kafka-ui:
-    image: provectuslabs/kafka-ui:latest
-    container_name: loyalty-promotion-kafka-ui
-    ports:
-      - "8085:8080"
-    environment:
-      KAFKA_CLUSTERS_0_NAME: local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
-    depends_on:
-      - kafka
-
-  redis:
-    image: redis:7-alpine
-    container_name: loyalty-promotion-redis
-    ports:
-      - "6379:6379"
-    command: redis-server --appendonly yes
-    volumes:
-      - redis_data:/data
-
-volumes:
-  postgres_data:
-  kafka_data:
-  redis_data:
+Mailpit UI:      8025
 ```
 
 ### Запуск для разработчика
 
 ```bash
-# Поднять инфраструктуру
-docker compose up -d postgres kafka kafka-ui redis
+# Поднять все локальные сервисы
+rtk docker compose up -d
 
-# Запустить Laravel из IDE / терминала
-php artisan serve
+# Проверить статус контейнеров
+rtk docker compose ps
+
+# Выполнить миграции
+rtk docker compose exec app php artisan migrate
+
+# Открыть приложение
+http://127.0.0.1:8080/admin
 
 # Логи
-docker compose logs -f kafka
-docker compose logs -f postgres
+rtk docker compose logs -f app
+rtk docker compose logs -f kafka
 
 # Остановить
-docker compose down
+rtk docker compose down
 
 # Остановить и удалить volumes
-docker compose down -v
+rtk docker compose down -v
 ```
 
 ### application-local.yml (Laravel .env аналог)
@@ -516,19 +476,20 @@ docker compose down -v
 ```env
 APP_ENV=local
 DB_CONNECTION=pgsql
-DB_HOST=127.0.0.1
+DB_HOST=postgres
 DB_PORT=5432
 DB_DATABASE=loyalty_promotion
 DB_USERNAME=loyalty_user
 DB_PASSWORD=loyalty_password
 
-KAFKA_BROKERS=localhost:9092
+KAFKA_BROKERS=kafka:9092
 
-REDIS_HOST=127.0.0.1
+REDIS_HOST=redis
 REDIS_PORT=6379
 
 IIKO_CLOUD_BASE_URL=https://api-ru.iiko.services/api
 IIKO_API_LOGIN=xxxxxxxx
+IIKO_CLOUD_CALL_CENTER_ORG_ID=84f0f1ff-1ba0-4857-bfc6-1ae23b0b4cb1
 ```
 
 ### Development rules
@@ -573,13 +534,14 @@ ActionHandlerRegistry
 
 ## 2.2 CustomerWallet
 
-Отвечает за то, какие rewards/купоны есть у конкретного клиента и как они используются.
+Исторический/опциональный модуль для customer coupon wallet.
+
+В текущем checkout flow `customer_coupon_id` не используется: клиент всегда передает `coupon_code`.
+Автоматически выданные guarantee coupons создаются как отдельные записи в `coupons` с уникальным `code`.
 
 ```
-customer_coupons
 coupon_usages
-available rewards
-reward history
+customer_coupons (legacy / optional)
 ```
 
 ## 2.3 Loyalty
@@ -672,33 +634,32 @@ IncentivePolicy проверяет совместимость с BellCoin / др
 Promotion применяет скидку или free item
 ```
 
-## 3.2 Issued customer coupon
+## 3.2 Issued guarantee coupon
 
-Гарантированный купон, который заранее выдан конкретному клиенту.
+Гарантированный купон создается автоматически из template coupon и получает уникальный `code`.
 
 ```
-Клиент сделал 5 закрытых заказов → получил бесплатную доставку
 Клиент получил компенсационный купон за позднюю доставку
-Call Center вручную выдал купон клиенту
-Клиент не заказывал 30+ дней → получил купон реактивации
 ```
 
 Flow:
 
 ```
-Issue condition matched
+Kafka Delivered event
   ↓
-CustomerWallet создаёт customer_coupon
+DeliveryGuaranteeCouponIssueService считает delivered_at - cooking_start_at
   ↓
-Клиент видит купон в мобильном приложении
+Issue condition matched: order.delivery_time_over > 35
   ↓
-Клиент выбирает купон на checkout
+Создается новый coupons.code, например DELIVERY-GUARANTEE-6918295-A1B2C3
   ↓
-Promotion проверяет usage conditions
+Клиент получает этот code
+  ↓
+Checkout применяет coupon_code
+  ↓
+Promotion проверяет usage conditions/actions
   ↓
 IncentivePolicy проверяет compatibility
-  ↓
-CustomerWallet фиксирует usage
 ```
 
 ## 3.3 BellCoin
@@ -744,9 +705,18 @@ coupons
 - stackable
 - is_stackable_with_bellcoin boolean default false
 - is_stackable_with_other_coupons boolean default false
+- issued_from_coupon_id nullable
+- issued_customer_id nullable
+- issued_customer_phone nullable
+- source_order_id nullable
+- source_event_id nullable
 ```
 
 Примечание: `discount_type` и `discount_value` должны жить в `coupon_actions`.
+
+`issued_from_coupon_id`, `source_order_id` и `source_event_id` используются для автоматически созданных купонов. Template coupon имеет `coupon_kind = issued_customer_coupon` и `issued_from_coupon_id = null`; checkout не применяет такой template напрямую.
+
+Автоматически выданный купон имеет свой уникальный `code` и `issued_from_coupon_id = template.id`.
 
 ## 4.2 coupon_actions
 
@@ -781,7 +751,9 @@ coupon_actions
 
 ## 5.1 customer_coupons
 
-Конкретный купон, выданный конкретному клиенту.
+Legacy / optional таблица для wallet-модели.
+
+Текущий checkout не принимает `customer_coupon_id`; применение идет только по `coupons.code`.
 
 ```
 customer_coupons
@@ -816,7 +788,7 @@ unique(customer_id, coupon_id, campaign_key)
 coupon_usages
 - id
 - coupon_id
-- customer_coupon_id nullable
+- customer_coupon_id nullable legacy
 - customer_id
 - order_id
 - status: reserved / applied / cancelled / expired
@@ -1125,14 +1097,13 @@ Request — идентичен preview.
 Внутри:
 
 ```
-Validate coupon / customer_coupon
+Validate coupon by coupon_code
 Validate BellCoin balance + redemption rules
 Check StackingRules
 Check total discount limits
 
 BEGIN TRANSACTION
   coupon_usage → reserved
-  customer_coupon → reserved
   BellCoin → reserved (lockForUpdate на loyalty_account)
   order_incentive_application → reserved (без order_id пока)
 COMMIT
@@ -1167,7 +1138,6 @@ BEGIN TRANSACTION
   order_incentive_application.order_id = 999
   order_incentive_application → applied
   coupon_usage → applied
-  customer_coupon → used
   BellCoin reservation → committed
 COMMIT
 ```
@@ -1184,7 +1154,6 @@ Scheduled job каждую минуту:
 
   Для каждого:
     coupon_usage → cancelled
-    customer_coupon → available
     BellCoin → released
     order_incentive_application → cancelled
 ```
@@ -1203,7 +1172,6 @@ POST /api/incentives/checkout/cancel
 
 ```
 coupon_usage → cancelled
-customer_coupon → available
 BellCoin → released
 order_incentive_application → cancelled
 ```
@@ -1396,10 +1364,8 @@ BellCoinReleaseHandler
 ## Required events for MVP
 
 ```
-order.status_changed
-order.closed
-order.cancelled
-order.delayed
+Delivered
+order.status_changed / WaitCooking
 ```
 
 ## Event processing flow
@@ -1412,10 +1378,88 @@ order.delayed
 5. Обновить customer_behavior_stats.
 6. Проверить issue rules для coupons/rewards.
 7. Проверить loyalty accrual rules.
-8. Выдать customer_coupon или начислить BellCoin.
+8. Выдать coupon code или начислить BellCoin.
 9. Опубликовать coupon.issued / loyalty.bellcoin_accrued.
 10. Пометить event как processed.
 ```
+
+## 13.1 Delivery guarantee coupon
+
+Источник: Kafka event с `event_type = Delivered`.
+
+Используемые поля:
+
+```json
+{
+  "event_id": "Delivered-uuid",
+  "event_type": "Delivered",
+  "payload": {
+    "id": 6918295,
+    "status": "Delivered",
+    "timestamps": {
+      "cooking_start_at": "2026-05-27 16:12:07",
+      "delivered_at": "2026-05-27 16:46:46"
+    },
+    "customer": {
+      "id": null,
+      "phone": "+998332002852"
+    }
+  }
+}
+```
+
+Расчет:
+
+```text
+delivery_duration_minutes = delivered_at - cooking_start_at
+```
+
+Template coupon в админке:
+
+```text
+code = DELIVERY_GUARANTEE
+coupon_kind = issued_customer_coupon
+status = active
+```
+
+Issue Conditions:
+
+```text
+condition_type = order.delivery_time_over
+operator = >
+value = 35
+```
+
+Actions:
+
+```text
+action_type = fixed
+value = 30000
+```
+
+Результат:
+
+```text
+DeliveryGuaranteeCouponIssueService создает новый coupons.code:
+DELIVERY-GUARANTEE-6918295-A1B2C3
+```
+
+Новый купон:
+
+- `coupon_kind = public_code_coupon`;
+- `status = active`;
+- `usage_limit_total = 1`;
+- `usage_limit_per_customer = 1`;
+- `issued_from_coupon_id = template.id`;
+- `source_order_id = payload.id`;
+- `source_event_id = event_id`;
+- copies `conditions` and `actions` from template.
+
+Idempotency:
+
+- duplicate Kafka event игнорируется через `event_inbox.event_id`;
+- повторная выдача по одному заказу блокируется unique `issued_from_coupon_id + source_order_id`;
+- template coupon не применяется в checkout напрямую.
 
 ## Idempotency
 
@@ -1452,9 +1496,9 @@ Cancelled
 | Status | Роль |
 | --- | --- |
 | Closed | Основной статус для completed order stats, milestone rewards и BellCoin accrual |
-| Cancelled | Cancel usage / restore customer_coupon / release BellCoin |
-| Delayed | Potential compensation trigger только с threshold |
-| Delivered | Факт доставки; stats лучше считать по Closed |
+| Cancelled | Cancel usage / release BellCoin |
+| Delayed | Optional signal; guarantee coupon сейчас выдается по Delivered duration |
+| Delivered | Факт доставки; используется для guarantee coupon через cooking_start_at/delivered_at |
 | Early statuses | Хранить в projection/history, но не выдавать rewards автоматически |
 
 ---
@@ -1521,20 +1565,16 @@ interface CustomerSegmentProviderInterface {
 ## Promotion / coupons
 
 ```
-POST /api/coupons/validate
-POST /api/coupons/apply
-POST /api/coupons/{coupon_id}/simulate
-GET  /api/coupon-builder/condition-definitions
-GET  /api/coupon-builder/action-definitions
+Filament admin: /admin
+Docs: docs/create-coupon-ru.md
+Docs: docs/coupon-algorithm-ru.md
 ```
 
 ## CustomerWallet
 
 ```
 GET  /api/customers/{customer_id}/coupons/available
-POST /api/customers/{customer_id}/coupons/issue
-POST /api/customer-coupons/{customer_coupon_id}/validate
-POST /api/customer-coupons/{customer_coupon_id}/apply
+Legacy / optional. Checkout does not accept customer_coupon_id.
 ```
 
 ## Loyalty / BellCoin
@@ -1616,10 +1656,9 @@ INTERNAL_ERROR
 
 ## Phase 3 — CustomerWallet
 
-- customer_coupons
-- manual issue
-- available coupons endpoint
-- validate/apply customer_coupon
+- legacy / optional customer_coupons
+- available coupons endpoint if wallet UI is needed
+- checkout still applies only coupon_code
 
 ## Phase 4 — Integration + Projection
 
@@ -1630,11 +1669,10 @@ INTERNAL_ERROR
 
 ## Phase 5 — Automatic Rewards
 
-- coupon_issue_rules
 - coupon_issue_conditions
-- automatic issue engine
-- reactivation condition
-- coupon.issued event
+- automatic issue engine for Delivered guarantee coupon
+- unique coupons.code generation from template coupon
+- coupon.issued event if downstream notification is needed
 
 ## Phase 6 — Loyalty / BellCoin
 
@@ -1713,7 +1751,7 @@ Promotion + CustomerWallet + Catalog + Kafka projection: 5–7 недель
 | 9 | Можно ли использовать BellCoin для оплаты delivery fee? | **Нет**. Только к products amount. |
 | 10 | Есть ли срок жизни BellCoin? | **Да, 1 год** с момента начисления. |
 | 11 | Что делать с BellCoin при Cancelled/refund? | **Reversal transaction**. |
-| 12 | Должен ли cancelled order возвращать customer_coupon в available? | **Да**. Idempotent. |
+| 12 | Должен ли cancelled order возвращать выданный guarantee coupon? | **Нет**. В checkout резервируется только coupon_usage; сам issued coupon остается, но лимит освобождается после cancel usage. |
 | 13 | Кто добавляет free_product в заказ? | **Loyalty & Promotion Service**. |
 | 14 | Когда free_product виден клиенту? | **Только на checkout**. |
 | 15 | Нужно ли показывать BellCoin в fiscal/receipt? | **Нет**. |
@@ -1774,14 +1812,13 @@ related_transaction_id = original_accrual_transaction_id
 
 Все изменения BellCoin только через `loyalty_ledger_transactions`. Нельзя уменьшать balance без ledger entry.
 
-## 20.4. Customer coupon revert при Cancelled
+## 20.4. Coupon usage revert при Cancelled
 
 ```
 coupon_usage → cancelled
-customer_coupon → available
 ```
 
-Idempotent: повторный `order.cancelled` event не должен вернуть coupon дважды.
+Idempotent: повторный cancel event не должен изменить уже cancelled/applied application.
 
 ## 20.5. Free product ownership
 
@@ -1860,7 +1897,6 @@ app/Filament/
 Tab 1 — Основная информация
   code, name, coupon_kind, status, priority
   starts_at, ends_at
-  usage_limit_total, usage_limit_per_customer
   auto_apply, visible_to_customer, requires_code_input
 
 Tab 2 — Условия использования
@@ -1870,7 +1906,10 @@ Tab 2 — Условия использования
   (cart.has_combo → без доп. полей)
 
 Tab 3 — Условия выдачи
-  Repeater: аналогично условиям использования
+  Repeater:
+    order.delivery_time_over → value minutes
+    customer.segment → value / payload.segment_code
+    cart.min_amount → value
 
 Tab 4 — Действие
   Select: action_type
@@ -1886,7 +1925,9 @@ Tab 5 — Совместимость
   Toggle: is_stackable_with_other_coupons
 
 Tab 6 — Лимиты
+  usage_limit_total, usage_limit_per_customer
   issue_limit_total, issue_limit_per_customer
+  issue_policy
 ```
 
 ### Управление BellCoin / ledger
@@ -1916,16 +1957,17 @@ AdjustBalanceAction → вводит сумму и причину → созда
 раскрывается: incentives_snapshot json
 ```
 
-### Управление customer_coupons
+### Автоматически выданные купоны
 
-`CustomerCouponResource` — таблица выданных купонов.
+Автоматически выданные guarantee coupons отображаются в `CouponResource`, потому что это обычные записи в `coupons` с уникальным `code`.
 
-Ручная выдача через Action:
+Их можно отличить по source полям:
 
 ```
-IssueCustomerCouponAction
-  → выбрать клиента + купон + причину
-  → вызывает CustomerCouponIssueService
+issued_from_coupon_id
+issued_customer_id / issued_customer_phone
+source_order_id
+source_event_id
 ```
 
 ### Сегменты клиентов
@@ -1971,7 +2013,7 @@ Repeater::make('conditions')
 
 ```
 Форма:
-  coupon_code или customer_coupon_id
+  coupon_code
   order_total
   items (repeater: iiko_product_id + quantity)
   use_bellcoin + bellcoin_amount
@@ -1997,7 +2039,6 @@ Repeater::make('conditions')
 | Conditions/Actions Repeater builder | средняя | 2–3 дня |
 | LoyaltyAccountResource + ledger | низкая | 1 день |
 | OrderIncentiveApplicationResource | низкая | 1 день |
-| CustomerCouponResource + issue action | низкая | 1 день |
 | CustomerStatsResource + segments | низкая | 1 день |
 | Simulation page | средняя | 1–2 дня |
 | **Итого** | | **9–12 дней** |
@@ -2023,7 +2064,7 @@ Repeater::make('conditions')
 1.  Называть систему Loyalty & Promotion Service, а не Coupon Service.
 2.  Модульный монолит на Laravel с нативными namespaces.
 3.  Promotion отвечает за coupons, actions, conditions и builder.
-4.  CustomerWallet отвечает за customer_coupons и usages.
+4.  CustomerWallet legacy/optional; текущий checkout применяет только `coupon_code`.
 5.  Loyalty отвечает за BellCoin, ledger и reserve/commit/release.
 6.  CustomerInsights отвечает за stats и segmentation.
 7.  Catalog отвечает за локальный IIKO snapshot.

@@ -1,0 +1,176 @@
+services:
+    app:
+        build:
+            context: .
+            dockerfile: Dockerfile
+            args:
+                UID: ${UID:-1000}
+                GID: ${GID:-1000}
+        container_name: loyalty-service-app
+        restart: unless-stopped
+        working_dir: /var/www/html
+        environment:
+            APP_NAME: ${APP_NAME:-Loyalty Promotion Service}
+            APP_ENV: local
+            APP_KEY: ${APP_KEY:-}
+            APP_DEBUG: ${APP_DEBUG:-true}
+            APP_URL: http://127.0.0.1:8080
+            ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+            LOG_CHANNEL: ${LOG_CHANNEL:-stack}
+            LOG_LEVEL: ${LOG_LEVEL:-debug}
+            DB_CONNECTION: pgsql
+            DB_HOST: postgres
+            DB_PORT: 5432
+            DB_DATABASE: loyalty_promotion
+            DB_USERNAME: loyalty_user
+            DB_PASSWORD: loyalty_password
+            CACHE_DRIVER: ${CACHE_DRIVER:-redis}
+            QUEUE_CONNECTION: ${QUEUE_CONNECTION:-redis}
+            SESSION_DRIVER: ${SESSION_DRIVER:-redis}
+            REDIS_HOST: redis
+            REDIS_PORT: 6379
+            KAFKA_BROKERS: kafka:9092
+            IIKO_CLOUD_BASE_URL: ${IIKO_CLOUD_BASE_URL:-https://api-ru.iiko.services/api}
+            IIKO_API_LOGIN: ${IIKO_API_LOGIN:-}
+            MAIL_MAILER: smtp
+            MAIL_HOST: mailpit
+            MAIL_PORT: 1025
+            MAIL_USERNAME: null
+            MAIL_PASSWORD: null
+            MAIL_ENCRYPTION: null
+            MAIL_FROM_ADDRESS: ${MAIL_FROM_ADDRESS:-hello@example.com}
+            MAIL_FROM_NAME: ${MAIL_FROM_NAME:-Loyalty Promotion Service}
+        ports:
+            - "8080:8000"
+        volumes:
+            - .:/var/www/html
+            - vendor_data:/var/www/html/vendor
+        depends_on:
+            postgres:
+                condition: service_healthy
+            redis:
+                condition: service_started
+            kafka:
+                condition: service_started
+
+    scheduler:
+        build:
+            context: .
+            dockerfile: Dockerfile
+            args:
+                UID: ${UID:-1000}
+                GID: ${GID:-1000}
+        container_name: loyalty-service-scheduler
+        restart: unless-stopped
+        working_dir: /var/www/html
+        command: php artisan schedule:work
+        environment:
+            APP_NAME: ${APP_NAME:-Loyalty Promotion Service}
+            APP_ENV: local
+            APP_KEY: ${APP_KEY:-}
+            APP_DEBUG: ${APP_DEBUG:-true}
+            APP_URL: http://127.0.0.1:8080
+            DB_HOST: postgres
+            DB_PORT: 5432
+            DB_DATABASE: loyalty_promotion
+            DB_USERNAME: loyalty_user
+            DB_PASSWORD: loyalty_password
+            CACHE_DRIVER: ${CACHE_DRIVER:-redis}
+            QUEUE_CONNECTION: ${QUEUE_CONNECTION:-redis}
+            SESSION_DRIVER: ${SESSION_DRIVER:-redis}
+            REDIS_HOST: redis
+            REDIS_PORT: 6379
+            KAFKA_BROKERS: kafka:9092
+            IIKO_CLOUD_BASE_URL: ${IIKO_CLOUD_BASE_URL:-https://api-ru.iiko.services/api}
+            IIKO_API_LOGIN: ${IIKO_API_LOGIN:-}
+        volumes:
+            - .:/var/www/html
+            - vendor_data:/var/www/html/vendor
+        depends_on:
+            postgres:
+                condition: service_healthy
+            redis:
+                condition: service_started
+            kafka:
+                condition: service_started
+
+    postgres:
+        image: postgres:16-alpine
+        container_name: loyalty-service-postgres
+        restart: unless-stopped
+        environment:
+            POSTGRES_DB: loyalty_promotion
+            POSTGRES_USER: loyalty_user
+            POSTGRES_PASSWORD: loyalty_password
+        ports:
+            - "5432:5432"
+        volumes:
+            - postgres_data:/var/lib/postgresql/data
+        healthcheck:
+            test: [ "CMD-SHELL", "pg_isready -U loyalty_user -d loyalty_promotion" ]
+            interval: 5s
+            timeout: 5s
+            retries: 10
+
+    redis:
+        image: redis:7-alpine
+        container_name: loyalty-service-redis
+        restart: unless-stopped
+        command: redis-server --appendonly yes
+        ports:
+            - "6379:6379"
+        volumes:
+            - redis_data:/data
+
+    kafka:
+        image: apache/kafka:latest
+        container_name: loyalty-service-kafka
+        restart: unless-stopped
+        ports:
+            - "9092:9094"
+        environment:
+            KAFKA_NODE_ID: 1
+            KAFKA_PROCESS_ROLES: broker,controller
+            KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+            KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9092
+            KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+
+            KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+            KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+            KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+            KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+            KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+            KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+            CLUSTER_ID: loyalty-service-cluster-1
+        volumes:
+            - kafka_data:/var/lib/kafka/data
+
+    kafka-ui:
+        image: provectuslabs/kafka-ui:latest
+        container_name: loyalty-service-kafka-ui
+        restart: unless-stopped
+        ports:
+            - "8085:8080"
+        environment:
+            KAFKA_CLUSTERS_0_NAME: local
+            KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+        depends_on:
+            - kafka
+
+    mailpit:
+        image: axllent/mailpit:latest
+        container_name: loyalty-service-mailpit
+        restart: unless-stopped
+        ports:
+            - "8025:8025"
+            - "1025:1025"
+
+volumes:
+    vendor_data:
+    postgres_data:
+    redis_data:
+    kafka_data:
